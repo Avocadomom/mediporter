@@ -1,0 +1,194 @@
+# raw2yaml.py — RAW 텍스트(우리 템플릿) -> YAML 변환기 (무의존성)
+# ★ 맨 위 IN_DIR, OUT_DIR만 바꾸면 됩니다.
+
+import os, re, glob, datetime, sys
+
+# ====== 설정(여기만 바꾸세요) ======
+IN_DIR  = r"C:\Users\USER\OneDrive\raw"       # TXT가 모여 있는 폴더
+OUT_DIR = r"C:\MediPorter\yaml_out"  # YAML 결과가 저장될 폴더
+FILE_GLOB = "*.txt"                  # 확장자 패턴
+# ===================================
+
+
+def read_text(path):
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
+
+def header(text, key):
+    """ 텍스트 머리글에서 '# key: value' 추출 """
+    m = re.search(rf"(?mi)^#\s*{re.escape(key)}\s*:\s*(.*)$", text)
+    return m.group(1).strip() if m else ""
+
+
+def split_sources(text):
+    """
+    '=== SOURCE: ... ===' 마커로 섹션 분리.
+    의약품안전나라 → mfds, UpToDate/Lexi → uptodate_lexi, 심평원/보험 → hira 로 매핑.
+    그 외는 other에 들어갑니다.
+    """
+    parts = []
+    pattern = re.compile(r"(?mi)^===\s*SOURCE:\s*(.+?)\s*===\s*$")
+    last_pos = 0
+    last_label = "raw"
+
+    for m in pattern.finditer(text):
+        if last_pos != 0:
+            section = text[last_pos:m.start()].strip()
+            parts.append((last_label, section))
+        last_label = m.group(1).strip()
+        last_pos = m.end()
+
+    if last_pos == 0:
+        # 마커가 없는 경우 통째로 raw
+        return {"raw": text.strip()}
+    else:
+        parts.append((last_label, text[last_pos:].strip()))
+
+    mapped = {}
+    for label, section in parts:
+        low = label.lower()
+        if ("의약품안전나라" in label) or ("nedrug" in low):
+            key = "mfds"
+        elif ("uptodate" in low) or ("lexi" in low) or ("lexidrug" in low):
+            key = "uptodate_lexi"
+        elif ("심사" in label) or ("보험" in label) or ("hira" in low):
+            key = "hira"
+        else:
+            # 기타는 소문자+언더스코어로 키 생성
+            key = re.sub(r"[^a-z0-9]+", "_", low).strip("_") or "other"
+
+        # 같은 키가 여러 번 나오면 이어붙임
+        mapped[key] = (mapped.get(key, "") + ("\n\n" if key in mapped and section else "") + section)
+    return mapped
+
+
+def sanitize_filename(name):
+    name = (name or "unknown").strip()
+    name = re.sub(r'[\\/:*?"<>|]', "", name)   # 금지문자 제거
+    name = re.sub(r"\s+", "_", name)           # 공백 → _
+    return name or "unknown"
+
+
+def indent_block(s, n=2):
+    pad = " " * n
+    return "\n".join(pad + (line if line.strip() else "") for line in s.splitlines())
+
+
+def to_yaml(doc: dict) -> str:
+    """
+    간단 YAML 직렬화기 (dict/list/str만 가정).
+    멀티라인/긴 문자열은 block style(|) 사용.
+    """
+    lines = []
+
+    def dump(obj, indent=0, key=None):
+        pad = " " * indent
+        if isinstance(obj, dict):
+            if key is not None:
+                lines.append(f"{pad}{key}:")
+            for k, v in obj.items():
+                dump(v, indent + (0 if key is None else 2), k)
+        elif isinstance(obj, list):
+            if key is not None:
+                lines.append(f"{pad}{key}:")
+            for item in obj:
+                if isinstance(item, (dict, list)):
+                    lines.append(f"{pad}-")
+                    dump(item, indent + 2, None)
+                else:
+                    s = str(item).replace('"', '\\"')
+                    lines.append(f'{pad}- "{s}"')
+        else:
+            s = str(obj)
+            if "\n" in s or len(s) > 120:
+                # block style
+                if key is not None:
+                    lines.append(f"{pad}{key}: |")
+                else:
+                    lines.append(f"{pad}|")
+                lines.append(indent_block(s, indent + 2))
+            else:
+                s = s.replace('"', '\\"')
+                if key is not None:
+                    lines.append(f'{pad}{key}: "{s}"')
+                else:
+                    lines.append(f'{pad}"{s}"')
+
+    dump(doc, 0, None)
+    return "\n".join(lines) + "\n"
+
+
+def convert_one(txt_path, out_dir):
+    raw = read_text(txt_path)
+    rec_id = header(raw, "id") or os.path.splitext(os.path.basename(txt_path))[0]
+    generic = header(raw, "generic")
+    ins_code = header(raw, "보험코드")
+
+    sources = split_sources(raw)
+    record = {
+        "id": rec_id,
+        "generic": generic,
+        "insurance_code": ins_code,
+        "sources": {
+            "mfds": sources.get("mfds", ""),
+            "uptodate_lexi": sources.get("uptodate_lexi", ""),
+            "hira": sources.get("hira", ""),
+            "other": {k: v for k, v in sources.items() if k not in {"mfds", "uptodate_lexi", "hira"}}
+        },
+        "brief": {  # 나중에 야간 요약 배치로 채움
+            "indications": "",
+            "dosing": "",
+            "renal": "",
+            "hepatic": "",
+            "interactions": [],
+            "warnings": "",
+            "adverse_effects": "",
+            "pregnancy": "",
+            "lactation": "",
+            "administration": ""
+        },
+        "meta": {
+            "created_at": datetime.datetime.utcnow().isoformat() + "Z",
+            "source_files": [os.path.basename(txt_path)]
+        }
+    }
+
+    safe_gen = sanitize_filename(generic)
+    out_name = f"{record['id']}_{safe_gen}.yaml"
+    out_path = os.path.join(out_dir, out_name)
+
+    os.makedirs(out_dir, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(to_yaml(record))
+
+    return out_path
+
+
+def main():
+    txt_files = sorted(glob.glob(os.path.join(IN_DIR, FILE_GLOB)))
+    total = len(txt_files)
+    if not total:
+        print(f"[WARN] 입력 폴더에 TXT가 없습니다: {IN_DIR}")
+        return
+
+    print(f"[INFO] Found {total} txt files in {IN_DIR}")
+    ok, fail = 0, 0
+    for i, path in enumerate(txt_files, 1):
+        try:
+            outp = convert_one(path, OUT_DIR)
+            ok += 1
+            print(f"[{i}/{total}] OK  -> {outp}")
+        except Exception as e:
+            fail += 1
+            print(f"[{i}/{total}] ERR -> {path} :: {e}")
+
+    print(f"\n[DONE] 성공 {ok} / 실패 {fail}  (출력: {OUT_DIR})")
+
+
+if __name__ == "__main__":
+    # (선택) 명령줄 인자로 폴더를 바꿔 실행하고 싶다면:
+    #   python raw2yaml.py "C:\in" "C:\out"
+    if len(sys.argv) >= 2: IN_DIR  = sys.argv[1]
+    if len(sys.argv) >= 3: OUT_DIR = sys.argv[2]
+    main()

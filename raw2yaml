@@ -1,194 +1,187 @@
-# raw2yaml.py — RAW 텍스트(우리 템플릿) -> YAML 변환기 (무의존성)
-# ★ 맨 위 IN_DIR, OUT_DIR만 바꾸면 됩니다.
+import argparse
+import re
+from pathlib import Path
+from datetime import datetime
+import yaml
 
-import os, re, glob, datetime, sys
+# --- YAML에서 멀티라인을 항상 '|' 블록 스타일로 ---
+def _str_presenter(dumper, data):
+    if isinstance(data, str) and ("\n" in data or len(data) > 80):
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data)
+yaml.add_representer(str, _str_presenter)
 
-# ====== 설정(여기만 바꾸세요) ======
-IN_DIR  = r"C:\Users\USER\OneDrive\raw"       # TXT가 모여 있는 폴더
-OUT_DIR = r"C:\MediPorter\yaml_out"  # YAML 결과가 저장될 폴더
-FILE_GLOB = "*.txt"                  # 확장자 패턴
-# ===================================
+# SOURCE 라벨 매핑 (파일 내 섹션 헤더를 표준 키로 정규화)
+SOURCE_KEY_MAP = {
+    "의약품안전나라": "mfds_raw",
+    "UpToDate / Lexidrug": "uptodate_lexidrug_raw",
+    "UpToDate": "uptodate_lexidrug_raw",
+    "Lexidrug": "uptodate_lexidrug_raw",
+    "건강보험심사평가원": "hira_raw",
+    "HIRA": "hira_raw",
+}
 
+SOURCE_HEADER_RE = re.compile(r"^===\s*SOURCE:\s*(.+?)\s*===\s*$", re.MULTILINE)
+ID_RE       = re.compile(r"^#\s*id:\s*(.+?)\s*$", re.MULTILINE | re.IGNORECASE)
+GENERIC_RE  = re.compile(r"^#\s*generic:\s*(.+?)\s*$", re.MULTILINE | re.IGNORECASE)
 
-def read_text(path):
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        return f.read()
+FILENAME_RE = re.compile(
+    r"^(?P<date>\d{8})_(?P<time>\d{6})_(?P<id>[A-Z]\d{2}[A-Z]{2}\d{2})_(?P<generic>.+)$"
+)
 
+def sanitize_filename(s: str) -> str:
+    s = s.strip().lower()
+    s = s.replace(" ", "_")
+    s = re.sub(r"[^a-z0-9_]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s
 
-def header(text, key):
-    """ 텍스트 머리글에서 '# key: value' 추출 """
-    m = re.search(rf"(?mi)^#\s*{re.escape(key)}\s*:\s*(.*)$", text)
-    return m.group(1).strip() if m else ""
+def parse_header(text: str, fallback_name: str):
+    drug_id = None
+    generic = None
 
+    m = ID_RE.search(text)
+    if m:
+        drug_id = m.group(1).strip()
 
-def split_sources(text):
+    m = GENERIC_RE.search(text)
+    if m:
+        generic = m.group(1).strip()
+
+    if not (drug_id and generic):
+        # 파일명에서 보정 (예: 20250902_235910_J01DD62_cefoperazone sodium_sulbactam sodium.txt)
+        name = Path(fallback_name).stem
+        m2 = FILENAME_RE.match(name)
+        if m2:
+            if not drug_id:
+                drug_id = m2.group("id")
+            if not generic:
+                generic = m2.group("generic").replace("_", " ").strip()
+
+    return drug_id, generic
+
+def split_sources(text: str):
     """
-    '=== SOURCE: ... ===' 마커로 섹션 분리.
-    의약품안전나라 → mfds, UpToDate/Lexi → uptodate_lexi, 심평원/보험 → hira 로 매핑.
-    그 외는 other에 들어갑니다.
+    파일 본문을 '=== SOURCE: XXX ===' 구분자로 분할하여 dict로 반환
     """
-    parts = []
-    pattern = re.compile(r"(?mi)^===\s*SOURCE:\s*(.+?)\s*===\s*$")
-    last_pos = 0
-    last_label = "raw"
+    chunks = {}
+    matches = list(SOURCE_HEADER_RE.finditer(text))
 
-    for m in pattern.finditer(text):
-        if last_pos != 0:
-            section = text[last_pos:m.start()].strip()
-            parts.append((last_label, section))
-        last_label = m.group(1).strip()
-        last_pos = m.end()
+    if not matches:
+        # SOURCE 구분자가 없는 경우, 전체를 unknown_raw로
+        chunks["unknown_raw"] = text.strip()
+        return chunks
 
-    if last_pos == 0:
-        # 마커가 없는 경우 통째로 raw
-        return {"raw": text.strip()}
-    else:
-        parts.append((last_label, text[last_pos:].strip()))
+    for i, m in enumerate(matches):
+        label = m.group(1).strip()
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        body = text[start:end].strip()
 
-    mapped = {}
-    for label, section in parts:
-        low = label.lower()
-        if ("의약품안전나라" in label) or ("nedrug" in low):
-            key = "mfds"
-        elif ("uptodate" in low) or ("lexi" in low) or ("lexidrug" in low):
-            key = "uptodate_lexi"
-        elif ("심사" in label) or ("보험" in label) or ("hira" in low):
-            key = "hira"
-        else:
-            # 기타는 소문자+언더스코어로 키 생성
-            key = re.sub(r"[^a-z0-9]+", "_", low).strip("_") or "other"
+        key = SOURCE_KEY_MAP.get(label, f"source__{sanitize_filename(label)}")
+        # 중복 키 방지 (동일 SOURCE가 여러 번 있는 경우 suffix)
+        original_key = key
+        k = 1
+        while key in chunks:
+            k += 1
+            key = f"{original_key}__{k}"
 
-        # 같은 키가 여러 번 나오면 이어붙임
-        mapped[key] = (mapped.get(key, "") + ("\n\n" if key in mapped and section else "") + section)
-    return mapped
+        chunks[key] = body
 
+    return chunks
 
-def sanitize_filename(name):
-    name = (name or "unknown").strip()
-    name = re.sub(r'[\\/:*?"<>|]', "", name)   # 금지문자 제거
-    name = re.sub(r"\s+", "_", name)           # 공백 → _
-    return name or "unknown"
-
-
-def indent_block(s, n=2):
-    pad = " " * n
-    return "\n".join(pad + (line if line.strip() else "") for line in s.splitlines())
-
-
-def to_yaml(doc: dict) -> str:
-    """
-    간단 YAML 직렬화기 (dict/list/str만 가정).
-    멀티라인/긴 문자열은 block style(|) 사용.
-    """
-    lines = []
-
-    def dump(obj, indent=0, key=None):
-        pad = " " * indent
-        if isinstance(obj, dict):
-            if key is not None:
-                lines.append(f"{pad}{key}:")
-            for k, v in obj.items():
-                dump(v, indent + (0 if key is None else 2), k)
-        elif isinstance(obj, list):
-            if key is not None:
-                lines.append(f"{pad}{key}:")
-            for item in obj:
-                if isinstance(item, (dict, list)):
-                    lines.append(f"{pad}-")
-                    dump(item, indent + 2, None)
-                else:
-                    s = str(item).replace('"', '\\"')
-                    lines.append(f'{pad}- "{s}"')
-        else:
-            s = str(obj)
-            if "\n" in s or len(s) > 120:
-                # block style
-                if key is not None:
-                    lines.append(f"{pad}{key}: |")
-                else:
-                    lines.append(f"{pad}|")
-                lines.append(indent_block(s, indent + 2))
-            else:
-                s = s.replace('"', '\\"')
-                if key is not None:
-                    lines.append(f'{pad}{key}: "{s}"')
-                else:
-                    lines.append(f'{pad}"{s}"')
-
-    dump(doc, 0, None)
-    return "\n".join(lines) + "\n"
-
-
-def convert_one(txt_path, out_dir):
-    raw = read_text(txt_path)
-    rec_id = header(raw, "id") or os.path.splitext(os.path.basename(txt_path))[0]
-    generic = header(raw, "generic")
-    ins_code = header(raw, "보험코드")
-
-    sources = split_sources(raw)
-    record = {
-        "id": rec_id,
+def build_yaml(drug_id: str, generic: str, sources: dict, source_file: Path):
+    now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    # 기본 스키마(필요한 구조만 남기고 나머지는 후속 요약 파이프라인에서 채움)
+    data = {
+        "id": drug_id,
         "generic": generic,
-        "insurance_code": ins_code,
-        "sources": {
-            "mfds": sources.get("mfds", ""),
-            "uptodate_lexi": sources.get("uptodate_lexi", ""),
-            "hira": sources.get("hira", ""),
-            "other": {k: v for k, v in sources.items() if k not in {"mfds", "uptodate_lexi", "hira"}}
+        "meta": {
+            "source_file": source_file.name,
+            "converted_at_utc": now,
+            "atc": drug_id,   # id가 ATC코드인 케이스에 한해 그대로 둠
         },
-        "brief": {  # 나중에 야간 요약 배치로 채움
+        "raw": sources,       # 원문 저장 (민감 데이터라면 여기서 비식별화/마스킹 로직 추가 가능)
+        "brief": "",          # GPT 요약 결과(후속 배치에서 채움)
+        "clinical": {
             "indications": "",
-            "dosing": "",
-            "renal": "",
-            "hepatic": "",
-            "interactions": [],
+            "dosing": {
+                "adult": "",
+                "pediatric": "",
+                "renal_adjustment": "",
+                "hepatic_adjustment": "",
+            },
+            "contraindications": "",
             "warnings": "",
-            "adverse_effects": "",
+            "adverse_reactions": "",
+            "interactions": "",
+            "monitoring": "",
+        },
+        "dur": {
             "pregnancy": "",
             "lactation": "",
-            "administration": ""
+            "contra_combo": [],
+            "caution_combo": [],
         },
-        "meta": {
-            "created_at": datetime.datetime.utcnow().isoformat() + "Z",
-            "source_files": [os.path.basename(txt_path)]
-        }
+        "notes": "",
     }
+    return data
 
-    safe_gen = sanitize_filename(generic)
-    out_name = f"{record['id']}_{safe_gen}.yaml"
-    out_path = os.path.join(out_dir, out_name)
+def convert_file(path: Path, out_dir: Path):
+    text = path.read_text(encoding="utf-8-sig", errors="ignore")
+    drug_id, generic = parse_header(text, path.name)
 
-    os.makedirs(out_dir, exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(to_yaml(record))
+    if not drug_id or not generic:
+        print(f"[WARN] ID/Generic 파싱 실패: {path.name}")
+        # 그래도 진행은 하되 unknown_*로 표기
+        drug_id = drug_id or "UNKNOWN_ID"
+        generic = generic or "UNKNOWN_GENERIC"
+
+    sources = split_sources(text)
+    y = build_yaml(drug_id, generic, sources, path)
+
+    # 파일명: <id>_<generic>.yaml
+    out_name = f"{sanitize_filename(drug_id)}_{sanitize_filename(generic)}.yaml"
+    out_path = out_dir / out_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    with out_path.open("w", encoding="utf-8") as f:
+        yaml.dump(y, f, allow_unicode=True, sort_keys=False, width=1000)
 
     return out_path
 
-
 def main():
-    txt_files = sorted(glob.glob(os.path.join(IN_DIR, FILE_GLOB)))
-    total = len(txt_files)
-    if not total:
-        print(f"[WARN] 입력 폴더에 TXT가 없습니다: {IN_DIR}")
+    parser = argparse.ArgumentParser(description="Convert raw drug .txt files to YAML.")
+    parser.add_argument(
+        "--in_dir",
+        default=r"C:\Users\USER\OneDrive\raw",
+        help="입력 폴더 (raw txt 위치)",
+    )
+    parser.add_argument(
+        "--out_dir",
+        default=None,
+        help="출력 폴더 (기본: 입력 폴더 상위의 'yaml')",
+    )
+    args = parser.parse_args()
+
+    in_dir = Path(args.in_dir)
+    if args.out_dir:
+        out_dir = Path(args.out_dir)
+    else:
+        out_dir = in_dir.parent / "yaml"
+
+    txt_files = sorted(in_dir.rglob("*.txt"))
+    if not txt_files:
+        print(f"[INFO] 입력 폴더에 txt가 없습니다: {in_dir}")
         return
 
-    print(f"[INFO] Found {total} txt files in {IN_DIR}")
-    ok, fail = 0, 0
-    for i, path in enumerate(txt_files, 1):
+    print(f"[INFO] 변환 시작: {len(txt_files)}개 파일")
+    for p in txt_files:
         try:
-            outp = convert_one(path, OUT_DIR)
-            ok += 1
-            print(f"[{i}/{total}] OK  -> {outp}")
+            out_path = convert_file(p, out_dir)
+            print(f"[OK] {p.name} -> {out_path.name}")
         except Exception as e:
-            fail += 1
-            print(f"[{i}/{total}] ERR -> {path} :: {e}")
-
-    print(f"\n[DONE] 성공 {ok} / 실패 {fail}  (출력: {OUT_DIR})")
-
+            print(f"[ERROR] {p.name}: {e}")
 
 if __name__ == "__main__":
-    # (선택) 명령줄 인자로 폴더를 바꿔 실행하고 싶다면:
-    #   python raw2yaml.py "C:\in" "C:\out"
-    if len(sys.argv) >= 2: IN_DIR  = sys.argv[1]
-    if len(sys.argv) >= 3: OUT_DIR = sys.argv[2]
     main()
